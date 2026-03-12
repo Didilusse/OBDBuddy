@@ -136,7 +136,8 @@ struct DashboardView: View {
 
     // Drag state
     @State private var draggedID: UUID?
-    @State private var dragOffset: CGSize = .zero
+    @State private var dragTranslation: CGSize = .zero
+    @State private var frameAtDragStart: CGRect = .zero
 
     private let cardHeight: CGFloat = 120
     private let spacing: CGFloat = 12
@@ -196,47 +197,25 @@ struct DashboardView: View {
 
                 ForEach(Array(zip(gaugeConfigStore.configs, frames)), id: \.0.id) { config, frame in
                     let isDragged = draggedID == config.id
+                    // The dragged card's visual position is always:
+                    //   (where it was when drag started) + (finger translation)
+                    // We subtract the current frame origin so it stays under the finger
+                    // even after reordering changes the frame.
+                    let visualOffset: CGSize = isDragged
+                        ? CGSize(
+                            width: frameAtDragStart.minX + dragTranslation.width - frame.minX,
+                            height: frameAtDragStart.minY + dragTranslation.height - frame.minY
+                        )
+                        : .zero
 
                     gaugeCard(for: config)
                         .frame(width: frame.width, height: frame.height)
-                        .offset(
-                            x: frame.minX + (isDragged ? dragOffset.width : 0),
-                            y: frame.minY + (isDragged ? dragOffset.height : 0)
-                        )
+                        .offset(x: frame.minX + visualOffset.width,
+                                y: frame.minY + visualOffset.height)
                         .zIndex(isDragged ? 1 : 0)
                         .scaleEffect(isDragged ? 1.05 : 1.0)
                         .shadow(color: .black.opacity(isDragged ? 0.25 : 0), radius: 12, y: 8)
-                        .gesture(
-                            LongPressGesture(minimumDuration: 0.3)
-                                .sequenced(before: DragGesture())
-                                .onChanged { value in
-                                    switch value {
-                                    case .second(true, let drag):
-                                        if draggedID == nil {
-                                            withAnimation(.easeInOut(duration: 0.2)) {
-                                                if !isEditing { isEditing = true }
-                                                draggedID = config.id
-                                            }
-                                        }
-                                        dragOffset = drag?.translation ?? .zero
-
-                                        // Determine where the dragged card's center is
-                                        let dragCenter = CGPoint(
-                                            x: frame.midX + dragOffset.width,
-                                            y: frame.midY + dragOffset.height
-                                        )
-                                        reorderIfNeeded(dragCenter: dragCenter, frames: frames)
-                                    default:
-                                        break
-                                    }
-                                }
-                                .onEnded { _ in
-                                    withAnimation(.easeInOut(duration: 0.25)) {
-                                        draggedID = nil
-                                        dragOffset = .zero
-                                    }
-                                }
-                        )
+                        .gesture(dragGesture(for: config, currentFrame: frame, allFrames: frames))
                 }
             }
             .animation(.easeInOut(duration: 0.3), value: gaugeConfigStore.configs.map(\.id))
@@ -244,13 +223,47 @@ struct DashboardView: View {
         .frame(height: calculateGridHeight())
     }
 
-    /// Reorder configs when the dragged card overlaps another card's center area.
-    private func reorderIfNeeded(dragCenter: CGPoint, frames: [CGRect]) {
+    private func dragGesture(for config: GaugeConfig, currentFrame: CGRect, allFrames: [CGRect]) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .sequenced(before: DragGesture())
+            .onChanged { value in
+                switch value {
+                case .second(true, let drag):
+                    if draggedID == nil {
+                        // Record the frame at the moment dragging starts
+                        frameAtDragStart = currentFrame
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            if !isEditing { isEditing = true }
+                            draggedID = config.id
+                        }
+                    }
+                    dragTranslation = drag?.translation ?? .zero
+
+                    // The absolute position of the dragged card center
+                    let dragCenter = CGPoint(
+                        x: frameAtDragStart.midX + dragTranslation.width,
+                        y: frameAtDragStart.midY + dragTranslation.height
+                    )
+                    reorderIfNeeded(dragCenter: dragCenter, allFrames: allFrames)
+                default:
+                    break
+                }
+            }
+            .onEnded { _ in
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    draggedID = nil
+                    dragTranslation = .zero
+                }
+            }
+    }
+
+    /// Reorder configs when the dragged card overlaps another card's frame.
+    private func reorderIfNeeded(dragCenter: CGPoint, allFrames: [CGRect]) {
         guard let dragID = draggedID,
               let fromIndex = gaugeConfigStore.configs.firstIndex(where: { $0.id == dragID })
         else { return }
 
-        for (i, frame) in frames.enumerated() where i != fromIndex {
+        for (i, frame) in allFrames.enumerated() where i != fromIndex {
             if frame.contains(dragCenter) {
                 withAnimation(.easeInOut(duration: 0.2)) {
                     gaugeConfigStore.configs.move(

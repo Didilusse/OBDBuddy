@@ -1,14 +1,14 @@
 //
-//  OBDBuddyApp.swift
-//  OBDBuddy
+//  OBD2_GaugeApp.swift
+//  OBD2 Gauge
 //
-//  Created by Adil Rahmani on 3/12/26.
+//  Created by Adil Rahmani on 3/7/26.
 //
 
 import SwiftUI
 
 @main
-struct OBDBuddyApp: App {
+struct OBD2_GaugeApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()

@@ -28,12 +28,29 @@ enum BLEConnectionState: Equatable {
 
 /// Manages CoreBluetooth interactions for ELM327-based OBD-II adapters.
 @Observable
-final class BLEManager: NSObject {
+final class BLEManager: NSObject, ELM327Transport {
 
     var connectionState: BLEConnectionState = .disconnected
     var discoveredPeripherals: [DiscoveredPeripheral] = []
     var connectedPeripheralName: String?
     var errorMessage: String?
+
+    // MARK: - ELM327Transport Conformance
+
+    var transportState: TransportState {
+        switch connectionState {
+        case .disconnected: return .disconnected
+        case .scanning, .connecting, .discoveringServices: return .connecting
+        case .ready: return .ready
+        }
+    }
+
+    var connectedDeviceName: String? { connectedPeripheralName }
+
+    var transportError: String? {
+        get { errorMessage }
+        set { errorMessage = newValue }
+    }
 
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?

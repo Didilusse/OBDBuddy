@@ -4,15 +4,23 @@ import Observation
 /// Defines the data source for OBD-II readings.
 enum OBDMode {
     case csvPlayback
-    case liveConnection
+    case live
 }
 
 /// OBD-II PIDs used for polling live data.
 enum OBDPID: String, CaseIterable {
-    case rpm = "010C"
-    case speed = "010D"
+    case rpm         = "010C"
+    case speed       = "010D"
     case coolantTemp = "0105"
-    case throttle = "0111"
+    case throttle    = "0111"
+    case load        = "0104"
+    case iat         = "010F"
+    case map         = "010B"
+    case timing      = "010E"
+    case stft        = "0106"
+    case ltft        = "0107"
+    case battery     = "0142"
+    case o2b1s1      = "0114"
 }
 
 /// Provides real-time OBD-II gauge data from either CSV playback or a live BLE adapter.
@@ -35,7 +43,7 @@ final class OBDService {
     }
 
     let mode: OBDMode
-    var bleManager: BLEManager?
+    var transport: (any ELM327Transport)?
     var driveStore: DriveStore?
 
     private var pollingTask: Task<Void, Never>?
@@ -53,7 +61,7 @@ final class OBDService {
         switch mode {
         case .csvPlayback:
             startCSVPlayback()
-        case .liveConnection:
+        case .live:
             startLiveConnection()
         }
     }
@@ -66,7 +74,7 @@ final class OBDService {
     }
 
     func startRecording() {
-        guard mode == .liveConnection, !isRecording else { return }
+        guard mode == .live, !isRecording else { return }
         let now = Date()
         recordingStartDate = now
         currentSession = DriveSession(id: UUID(), startDate: now, dataPoints: [])
@@ -144,26 +152,26 @@ final class OBDService {
     // MARK: - Live Connection
 
     private func startLiveConnection() {
-        guard let ble = bleManager, ble.connectionState == .ready else {
-            print("BLE not connected")
+        guard let transport, transport.transportState == .ready else {
+            print("Transport not connected")
             isRunning = false
             return
         }
 
         pollingTask = Task {
             // Initialize ELM327
-            _ = await ble.sendCommand("ATZ")     // Reset
-            _ = await ble.sendCommand("ATE0")    // Echo off
-            _ = await ble.sendCommand("ATL0")    // Linefeeds off
-            _ = await ble.sendCommand("ATS0")    // Spaces off
-            _ = await ble.sendCommand("ATSP0")   // Auto-detect protocol
+            _ = await transport.sendCommand("ATZ")     // Reset
+            _ = await transport.sendCommand("ATE0")    // Echo off
+            _ = await transport.sendCommand("ATL0")    // Linefeeds off
+            _ = await transport.sendCommand("ATS0")    // Spaces off
+            _ = await transport.sendCommand("ATSP0")   // Auto-detect protocol
 
             // Poll loop
-            while !Task.isCancelled && ble.connectionState == .ready {
+            while !Task.isCancelled && transport.transportState == .ready {
                 for pid in OBDPID.allCases {
                     guard !Task.isCancelled else { break }
 
-                    let response = await ble.sendCommand(pid.rawValue)
+                    let response = await transport.sendCommand(pid.rawValue)
                     if let value = Self.parseOBDResponse(response, pid: pid) {
                         applyLiveValue(value, for: pid)
                     }
@@ -183,34 +191,87 @@ final class OBDService {
         // Strip non-hex characters and find the response bytes
         let hex = response.filter { $0.isHexDigit }
 
-        // Response starts with "41" + PID byte(s), then data bytes
-        // With ATS0 (no spaces), e.g. RPM 010C → response "410C1A2B"
+        // Header length depends on PID code length:
+        //   Mode 01 PIDs (01XX) → response "41XX..." → 4 hex chars header
+        //   Mode 01 PIDs (01XXYY, e.g. 0142) → response "4142..." → 4 hex chars header
+        // Data bytes start after "41" + PID byte(s).
+
         switch pid {
         case .rpm:
-            // Response: 41 0C A B → RPM = (A * 256 + B) / 4
+            // 41 0C A B → RPM = (A*256 + B) / 4
             guard hex.count >= 8,
                   let a = UInt8(hex.substring(4, length: 2), radix: 16),
                   let b = UInt8(hex.substring(6, length: 2), radix: 16) else { return nil }
             return Double(Int(a) * 256 + Int(b)) / 4.0
 
         case .speed:
-            // Response: 41 0D A → Speed in km/h, convert to mph
+            // 41 0D A → A km/h, convert to mph
             guard hex.count >= 6,
                   let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
             return Double(a) * 0.621371
 
         case .coolantTemp:
-            // Response: 41 05 A → Temp in °C = A - 40, convert to °F
+            // 41 05 A → A - 40 °C, convert to °F
             guard hex.count >= 6,
                   let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
             let celsius = Double(a) - 40.0
             return celsius * 9.0 / 5.0 + 32.0
 
         case .throttle:
-            // Response: 41 11 A → Throttle = A * 100 / 255
+            // 41 11 A → A / 2.55 %
             guard hex.count >= 6,
                   let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
             return Double(a) * 100.0 / 255.0
+
+        case .load:
+            // 41 04 A → A / 2.55 %
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a) * 100.0 / 255.0
+
+        case .iat:
+            // 41 0F A → A - 40 °C, convert to °F
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            let celsius = Double(a) - 40.0
+            return celsius * 9.0 / 5.0 + 32.0
+
+        case .map:
+            // 41 0B A → A kPa
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a)
+
+        case .timing:
+            // 41 0E A → A/2 - 64 degrees BTDC
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a) / 2.0 - 64.0
+
+        case .stft:
+            // 41 06 A → A/1.28 - 100 %
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a) / 1.28 - 100.0
+
+        case .ltft:
+            // 41 07 A → A/1.28 - 100 %
+            guard hex.count >= 6,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a) / 1.28 - 100.0
+
+        case .battery:
+            // 41 42 A B → (A*256 + B) / 1000 V
+            guard hex.count >= 8,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16),
+                  let b = UInt8(hex.substring(6, length: 2), radix: 16) else { return nil }
+            return Double(Int(a) * 256 + Int(b)) / 1000.0
+
+        case .o2b1s1:
+            // 41 14 A B → Voltage = A/200 V (we return voltage; trim = B/1.28 - 100)
+            guard hex.count >= 8,
+                  let a = UInt8(hex.substring(4, length: 2), radix: 16) else { return nil }
+            return Double(a) / 200.0
         }
     }
 
@@ -231,6 +292,22 @@ final class OBDService {
         case .throttle:
             snapshot.throttlePercent = value
             pidName = "Throttle position"; units = "%"
+        case .load:
+            pidName = "Calculated engine load"; units = "%"
+        case .iat:
+            pidName = "Intake air temperature"; units = "°F"
+        case .map:
+            pidName = "Intake manifold pressure"; units = "kPa"
+        case .timing:
+            pidName = "Ignition timing advance"; units = "° BTDC"
+        case .stft:
+            pidName = "Short term fuel trim"; units = "%"
+        case .ltft:
+            pidName = "Long term fuel trim"; units = "%"
+        case .battery:
+            pidName = "Control module voltage"; units = "V"
+        case .o2b1s1:
+            pidName = "O2 Sensor B1S1 voltage"; units = "V"
         }
 
         // Populate allReadings so latestValueByPID works in live mode

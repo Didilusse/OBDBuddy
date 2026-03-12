@@ -7,13 +7,21 @@
 
 import SwiftUI
 
+/// Selects the data source / transport for OBD-II communication.
+enum ConnectionMode: String, CaseIterable {
+    case csvPlayback = "CSV Playback"
+    case ble = "BLE (Veepeak)"
+    case tcp = "TCP (Emulator)"
+}
+
 struct ContentView: View {
     @State private var bleManager = BLEManager()
+    @State private var tcpTransport = TCPTransport()
     @State private var driveStore = DriveStore()
     @State private var service = OBDService(mode: .csvPlayback)
     @State private var gaugeConfigStore = GaugeConfigStore()
     @State private var settingsStore = SettingsStore()
-    @State private var isLiveMode = false
+    @State private var connectionMode: ConnectionMode = .csvPlayback
     @State private var showingScanner = false
 
     var body: some View {
@@ -57,16 +65,34 @@ struct ContentView: View {
                 Label("Settings", systemImage: "gear")
             }
         }
-        .onChange(of: isLiveMode) {
+        .onChange(of: connectionMode) {
             service.stop()
-            service = OBDService(mode: isLiveMode ? .liveConnection : .csvPlayback)
-            service.bleManager = bleManager
+            switch connectionMode {
+            case .csvPlayback:
+                service = OBDService(mode: .csvPlayback)
+            case .ble:
+                service = OBDService(mode: .live)
+                service.transport = bleManager
+            case .tcp:
+                service = OBDService(mode: .live)
+                service.transport = tcpTransport
+                if tcpTransport.transportState == .disconnected {
+                    tcpTransport.connect()
+                }
+            }
             service.driveStore = driveStore
         }
         .onAppear {
-            service.bleManager = bleManager
             service.driveStore = driveStore
             service.start()
+        }
+    }
+
+    private var isTransportReady: Bool {
+        switch connectionMode {
+        case .csvPlayback: return false
+        case .ble: return bleManager.transportState == .ready
+        case .tcp: return tcpTransport.transportState == .ready
         }
     }
 
@@ -74,20 +100,35 @@ struct ContentView: View {
     private var dashboardToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
             Menu {
-                Toggle("Live Mode", isOn: $isLiveMode)
+                Picker("Connection", selection: $connectionMode) {
+                    ForEach(ConnectionMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
 
-                if isLiveMode {
+                if connectionMode == .ble {
                     Button {
                         showingScanner = true
                     } label: {
                         Label(
-                            bleManager.connectionState == .ready
-                                ? "Connected: \(bleManager.connectedPeripheralName ?? "Device")"
+                            bleManager.transportState == .ready
+                                ? "Connected: \(bleManager.connectedDeviceName ?? "Device")"
                                 : "Connect Scanner",
-                            systemImage: bleManager.connectionState == .ready
-                                ? "checkmark.circle"
+                            systemImage: bleManager.transportState == .ready
+                                ? "checkmark.circle.fill"
                                 : "antenna.radiowaves.left.and.right"
                         )
+                    }
+                }
+
+                if connectionMode == .tcp {
+                    if tcpTransport.transportState == .ready {
+                        Label("Connected: \(tcpTransport.connectedDeviceName ?? "Emulator")",
+                              systemImage: "checkmark.circle.fill")
+                    } else {
+                        Button("Connect to Emulator") {
+                            tcpTransport.connect()
+                        }
                     }
                 }
             } label: {
@@ -97,7 +138,7 @@ struct ContentView: View {
 
         ToolbarItem(placement: .topBarTrailing) {
             HStack(spacing: 12) {
-                if isLiveMode && bleManager.connectionState == .ready {
+                if connectionMode != .csvPlayback && isTransportReady {
                     Button {
                         if service.isRecording {
                             service.stopRecording()
